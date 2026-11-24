@@ -24,22 +24,15 @@ app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173' }))
 app.use(express.json({ limit: '100kb' }))
 
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-8', legacyHeaders: false })
+const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: 'draft-8', legacyHeaders: false })
+const uploadExtensions = { 'application/pdf': '.pdf', 'image/jpeg': '.jpg', 'image/png': '.png' }
+app.use('/api', apiLimiter)
+
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: async (_req, _file, callback) => {
-      try {
-        await fs.mkdir(uploadsDirectory, { recursive: true })
-        callback(null, uploadsDirectory)
-      } catch (error) { callback(error) }
-    },
-    filename: (_req, file, callback) => {
-      const extension = { 'application/pdf': '.pdf', 'image/jpeg': '.jpg', 'image/png': '.png' }[file.mimetype]
-      callback(null, `${crypto.randomUUID()}${extension}`)
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, callback) => {
-    if (!['application/pdf', 'image/jpeg', 'image/png'].includes(file.mimetype)) {
+    if (!Object.hasOwn(uploadExtensions, file.mimetype)) {
       return callback(new Error('Only PDF, JPEG and PNG documents are allowed.'))
     }
     callback(null, true)
@@ -271,12 +264,10 @@ app.get('/api/leaves', authenticate, async (req, res) => {
 })
 
 app.post('/api/leaves', authenticate, allow('student'), upload.single('document'), async (req, res) => {
+  const storedName = req.file ? `${crypto.randomUUID()}${uploadExtensions[req.file.mimetype]}` : null
+  const storedPath = storedName ? path.join(uploadsDirectory, storedName) : null
   if (req.file) {
-    const handle = await fs.open(req.file.path, 'r')
-    const signature = Buffer.alloc(8)
-    const { bytesRead } = await handle.read(signature, 0, signature.length, 0)
-    await handle.close()
-    const bytes = signature.subarray(0, bytesRead)
+    const bytes = req.file.buffer.subarray(0, 8)
     const validSignature = req.file.mimetype === 'application/pdf'
       ? bytes.subarray(0, 5).toString() === '%PDF-'
       : req.file.mimetype === 'image/jpeg'
@@ -284,18 +275,13 @@ app.post('/api/leaves', authenticate, allow('student'), upload.single('document'
         : req.file.mimetype === 'image/png' && bytes.length === 8
           && bytes.equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     if (!validSignature) {
-      await fs.unlink(req.file.path).catch(() => {})
       return res.status(400).json({ error: 'The uploaded file is not a valid PDF, JPEG or PNG document.' })
     }
   }
   const parsed = leaveSchema.safeParse(req.body)
-  if (!parsed.success) {
-    if (req.file) await fs.unlink(req.file.path).catch(() => {})
-    return res.status(400).json({ error: validationError(parsed.error) })
-  }
+  if (!parsed.success) return res.status(400).json({ error: validationError(parsed.error) })
   let days
   try { days = calculateLeaveDays(parsed.data.start_date, parsed.data.end_date) } catch (error) {
-    if (req.file) await fs.unlink(req.file.path).catch(() => {})
     return res.status(400).json({ error: error.message })
   }
   const students = await query(
@@ -308,17 +294,23 @@ app.post('/api/leaves', authenticate, allow('student'), upload.single('document'
      WHERE s.user_id = ? LIMIT 1`,
     [req.user.id],
   )
-  if (!students.length) {
-    if (req.file) await fs.unlink(req.file.path).catch(() => {})
-    return res.status(400).json({ error: 'Complete your student profile before applying for leave.' })
-  }
+  if (!students.length) return res.status(400).json({ error: 'Complete your student profile before applying for leave.' })
   if (!students[0].class_teacher_user_id || !students[0].hod_user_id) {
-    if (req.file) await fs.unlink(req.file.path).catch(() => {})
     return res.status(400).json({ error: 'An active class teacher and HOD must be assigned before you can apply for leave.' })
   }
-  const connection = await pool.getConnection()
+  let connection
+  let transactionStarted = false
+  let fileWritten = false
   try {
+    if (req.file) {
+      await fs.mkdir(uploadsDirectory, { recursive: true })
+      const file = await fs.open(storedPath, 'wx')
+      fileWritten = true
+      try { await file.writeFile(req.file.buffer) } finally { await file.close() }
+    }
+    connection = await pool.getConnection()
     await connection.beginTransaction()
+    transactionStarted = true
     const [result] = await connection.execute(
       `INSERT INTO leave_applications
         (student_id, leave_type, start_date, end_date, days, reason, status)
@@ -333,7 +325,7 @@ app.post('/api/leaves', authenticate, allow('student'), upload.single('document'
     if (req.file) {
       await connection.execute(
         'INSERT INTO leave_documents (leave_application_id, original_name, stored_name, mime_type, file_size) VALUES (?, ?, ?, ?, ?)',
-        [result.insertId, path.basename(req.file.originalname.replaceAll('\\', '/')).slice(0, 255), path.basename(req.file.filename), req.file.mimetype, req.file.size],
+        [result.insertId, path.basename(req.file.originalname.replaceAll('\\', '/')).slice(0, 255), storedName, req.file.mimetype, req.file.size],
       )
     }
     if (students[0].class_teacher_user_id) await connection.execute(
@@ -343,10 +335,10 @@ app.post('/api/leaves', authenticate, allow('student'), upload.single('document'
     await connection.commit()
     res.status(201).json({ id: result.insertId, days, status: 'pending_class_teacher' })
   } catch (error) {
-    await connection.rollback()
-    if (req.file) await fs.unlink(req.file.path).catch(() => {})
+    if (transactionStarted) await connection.rollback()
+    if (fileWritten) await fs.unlink(storedPath).catch(() => {})
     throw error
-  } finally { connection.release() }
+  } finally { connection?.release() }
 })
 
 app.patch('/api/leaves/:id/decision', authenticate, allow('faculty', 'admin'), async (req, res) => {
@@ -417,7 +409,10 @@ app.get('/api/leaves/:id/document', authenticate, async (req, res) => {
   const documents = await query('SELECT stored_name, original_name, mime_type FROM leave_documents WHERE leave_application_id = ? LIMIT 1', [leave.id])
   const item = documents[0]
   if (!item) return res.status(404).json({ error: 'No document was uploaded for this application.' })
-  const storedName = path.basename(item.stored_name)
+  const storedName = item.stored_name
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(pdf|jpg|png)$/i.test(storedName)) {
+    return res.status(404).json({ error: 'The stored document is unavailable.' })
+  }
   return res.download(path.join(uploadsDirectory, storedName), item.original_name, { dotfiles: 'deny' })
 })
 
